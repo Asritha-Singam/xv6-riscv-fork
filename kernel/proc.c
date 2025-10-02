@@ -124,6 +124,8 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  p->next_fifo_seq = 0; 
+  p->num_resident = 0;
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -241,12 +243,16 @@ growproc(int n)
 
   sz = p->sz;
   if(n > 0){
+<<<<<<< HEAD
     if(sz + n > TRAPFRAME) {
       return -1;
     }
     if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
       return -1;
     }
+=======
+    sz+=n;
+>>>>>>> 267fe00 (first)
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
@@ -287,6 +293,8 @@ kfork(void)
     if(p->ofile[i])
       np->ofile[i] = filedup(p->ofile[i]);
   np->cwd = idup(p->cwd);
+  if(p->executable)
+    np->executable = idup(p->executable);
 
   safestrcpy(np->name, p->name, sizeof(p->name));
 
@@ -344,6 +352,15 @@ kexit(int status)
   iput(p->cwd);
   end_op();
   p->cwd = 0;
+
+  if (p->executable) {
+    iput(p->executable);
+    p->executable = 0;
+  }
+  if (p->executable) {
+    iput(p->executable);
+    p->executable = 0;
+  }
 
   acquire(&wait_lock);
 

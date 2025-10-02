@@ -293,6 +293,8 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 // physical memory.
 // returns 0 on success, -1 on failure.
 // frees any allocated pages on failure.
+// In vm.c -> This is the correct uvmcopy function
+
 int
 uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 {
@@ -303,17 +305,26 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
-      continue;   // page table entry hasn't been allocated
-    if((*pte & PTE_V) == 0)
-      continue;   // physical page hasn't been allocated
-    pa = PTE2PA(*pte);
-    flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
+      continue;
+
+    // Case 1: The page is resident (physically in memory).
+    if(*pte & PTE_V) {
+      pa = PTE2PA(*pte);
+      flags = PTE_FLAGS(*pte);
+      if((mem = kalloc()) == 0)
+        goto err;
+      memmove(mem, (char*)pa, PGSIZE);
+      if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+        kfree(mem);
+        goto err;
+      }
+    } 
+    // Case 2: The page is on-demand (not in memory, but exists on disk).
+    else if (*pte & PTE_ONDEMAND) {
+      pte_t *new_pte = walk(new, i, 1);
+      if (new_pte == 0)
+        goto err;
+      *new_pte = *pte; // Copy the on-demand PTE to the child.
     }
   }
   return 0;
@@ -322,7 +333,6 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   uvmunmap(new, 0, i / PGSIZE, 1);
   return -1;
 }
-
 // mark a PTE invalid for user access.
 // used by exec for the user stack guard page.
 void
@@ -449,29 +459,100 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 // that was lazily allocated in sys_sbrk().
 // returns 0 if va is invalid or already mapped, or if
 // out of physical memory, and physical address if successful.
+// In kernel/vm.c (replace the previous version)
+
+// Handles a page fault for a given virtual address.
+// The 'is_write' parameter is 1 if the fault was a store, 0 otherwise.
+// Returns 0 on success, -1 on failure.
+// In kernel/vm.c
+
 uint64
-vmfault(pagetable_t pagetable, uint64 va, int read)
+vmfault(pagetable_t pagetable, uint64 va, uint scause)
 {
-  uint64 mem;
   struct proc *p = myproc();
+  pte_t *pte;
+  uint64 mem;
 
-  if (va >= p->sz)
-    return 0;
-  va = PGROUNDDOWN(va);
-  if(ismapped(pagetable, va)) {
-    return 0;
+  // Determine access type from scause
+  char *access_type;
+  if (scause == 12) access_type = "exec";
+  else if (scause == 13) access_type = "read";
+  else if (scause == 15) access_type = "write";
+  else access_type = "unknown";
+
+  // Check for invalid access first.
+  if (va >= p->sz || va >= MAXVA) {
+    printf("[pid %d] KILL invalid-access va=0x%lx access=%s\n", p->pid, va, access_type);
+    return -1;
   }
-  mem = (uint64) kalloc();
-  if(mem == 0)
-    return 0;
-  memset((void *) mem, 0, PGSIZE);
-  if (mappages(p->pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0) {
-    kfree((void *)mem);
-    return 0;
+
+  uint64 pa_va = PGROUNDDOWN(va);
+  pte = walk(pagetable, pa_va, 0);
+
+  pte_t pte_val = (pte == 0) ? 0 : *pte;
+  printf("[pid %d] vmfault_debug: va=0x%lx, found pte_val=0x%lx\n", p->pid, va, pte_val);
+  
+  // Case 1: Page is on-demand from the executable.
+  if (pte != 0 && (*pte & PTE_V) == 0 && (*pte & PTE_ONDEMAND)) {
+    printf("[pid %d] PAGEFAULT va=0x%lx access=%s cause=exec\n", p->pid, va, access_type);
+    
+    mem = (uint64)kalloc();
+    if (mem == 0) return -1;
+    memset((void*)mem, 0, PGSIZE);
+
+    // Find the correct program segment header to load data from the file
+    struct elfhdr elf;
+    struct proghdr ph;
+    readi(p->executable, 0, (uint64)&elf, 0, sizeof(elf));
+    for (int i = 0, off = elf.phoff; i < elf.phnum; i++, off += sizeof(ph)) {
+      readi(p->executable, 0, (uint64)&ph, off, sizeof(ph));
+      if (ph.vaddr <= pa_va && pa_va < ph.vaddr + ph.memsz) {
+        uint64 file_offset = ph.off + (pa_va - ph.vaddr);
+        // How much to read from the file? It might be less than a full page.
+        uint read_sz = (ph.filesz > (pa_va - ph.vaddr)) ? (ph.filesz - (pa_va - ph.vaddr)) : 0;
+        if(read_sz > PGSIZE) read_sz = PGSIZE;
+
+        if (read_sz > 0 && readi(p->executable, 0, mem, file_offset, read_sz) != read_sz) {
+          kfree((void*)mem);
+          return -1;
+        }
+        break;
+      }
+    }
+    
+    printf("[pid %d] LOADEXEC va=0x%lx\n", p->pid, pa_va);
+    uint flags = PTE_FLAGS(*pte) | PTE_V;
+    flags &= ~PTE_ONDEMAND; // Turn off the on-demand flag
+    if (mappages(pagetable, pa_va, PGSIZE, mem, flags) != 0) {
+      kfree((void*)mem);
+      return -1;
+    }
   }
-  return mem;
+  // Case 2: Page is for heap/stack and has never been mapped.
+  else if (pte == 0) {
+    printf("[pid %d] PAGEFAULT va=0x%lx access=%s cause=heap\n", p->pid, va, access_type);
+    
+    mem = (uint64)kalloc();
+    if (mem == 0) return -1;
+    memset((void*)mem, 0, PGSIZE); // Zero-fill the page
+    
+    printf("[pid %d] ALLOC va=0x%lx\n", p->pid, pa_va);
+    if (mappages(pagetable, pa_va, PGSIZE, mem, PTE_R | PTE_W | PTE_U | PTE_V) != 0) {
+      kfree((void*)mem);
+      return -1;
+    }
+  } else {
+    // Any other case is an invalid access that should not happen
+    printf("[pid %d] KILL invalid-access va=0x%lx access=%s\n", p->pid, va, access_type);
+    return -1;
+  }
+  
+  // If we successfully handled the fault, log the RESIDENT event.
+  printf("[pid %d] RESIDENT va=0x%lx seq=%d\n", p->pid, pa_va, p->next_fifo_seq);
+  p->next_fifo_seq++;
+
+  return 0;
 }
-
 int
 ismapped(pagetable_t pagetable, uint64 va)
 {

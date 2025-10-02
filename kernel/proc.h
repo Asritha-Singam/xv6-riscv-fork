@@ -80,7 +80,11 @@ struct trapframe {
 };
 
 enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
-
+// A structure to track a page in physical memory (a resident page)
+struct resident_page {
+  uint64 va;  // The virtual address of the page
+  int seq;    // The FIFO sequence number when it was brought in
+};
 // Per-process state
 struct proc {
   struct spinlock lock;
@@ -104,4 +108,8 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+  struct inode *executable;
+  int next_fifo_seq;
+  struct resident_page resident_set[MAX_RESIDENT_PAGES];
+  int num_resident; // Number of pages currently in the resident set
 };
