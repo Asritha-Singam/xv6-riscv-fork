@@ -434,7 +434,6 @@ sys_chdir(void)
 uint64
 sys_exec(void)
 {
-  printf("[pid %d] sys_exec: entered.\n", myproc()->pid);
   char path[MAXPATH], *argv[MAXARG];
   int i;
   uint64 uargv, uarg;

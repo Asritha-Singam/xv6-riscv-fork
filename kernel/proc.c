@@ -243,20 +243,13 @@ growproc(int n)
 
   sz = p->sz;
   if(n > 0){
-<<<<<<< HEAD
     if(sz + n > TRAPFRAME) {
       return -1;
     }
-    if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
-      return -1;
-    }
-=======
-    sz+=n;
->>>>>>> 267fe00 (first)
+    p->sz = sz+n;
   } else if(n < 0){
-    sz = uvmdealloc(p->pagetable, sz, sz + n);
+    p->sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
-  p->sz = sz;
   return 0;
 }
 

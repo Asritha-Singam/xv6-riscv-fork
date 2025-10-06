@@ -68,7 +68,7 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
-  } else if(r_scause() == 12 || r_scause() == 13 || r_scause() == 15) {
+  } else if(r_scause() == 12 || r_scause() == 13 || r_scause() == 15 || r_scause() == 7 || r_scause() == 5) {
     // Instruction, load, or store page fault.
     // Pass 1 to vmfault if it's a write (store), 0 otherwise.
     if(vmfault(p->pagetable, r_stval(), r_scause()) < 0) {
@@ -81,13 +81,12 @@ usertrap(void)
     setkilled(p);
   }
 
-  if(killed(p))
+  if(killed(p)){
     kexit(-1);
-
+  }
   // give up the CPU if this is a timer interrupt.
   if(which_dev == 2)
     yield();
-
   prepare_return();
 
   // the user page table to switch to, for trampoline.S

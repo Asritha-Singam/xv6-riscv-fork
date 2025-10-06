@@ -226,8 +226,15 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
   for(a = oldsz; a < newsz; a += PGSIZE){
     mem = kalloc();
     if(mem == 0){
-      uvmdealloc(pagetable, a, oldsz);
-      return 0;
+      if(fifo_victim_selection() < 0) {
+        uvmdealloc(pagetable, a, oldsz);
+        return 0;
+      }
+      mem = kalloc();
+      if (mem == 0) {
+        // Still failed after replacement, this is a fatal error.
+        panic("uvmalloc: kalloc failed after replacement");
+      }
     }
     memset(mem, 0, PGSIZE);
     if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_R|PTE_U|xperm) != 0){
@@ -362,9 +369,12 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
   
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0) {
-      if((pa0 = vmfault(pagetable, va0, 0)) == 0) {
+      if((pa0 = vmfault(pagetable, va0, 15)) < 0) {
         return -1;
       }
+      pa0 = walkaddr(pagetable, va0);
+      if(pa0==0)
+        return -1;
     }
 
     pte = walk(pagetable, va0, 0);
@@ -396,9 +406,12 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
     va0 = PGROUNDDOWN(srcva);
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0) {
-      if((pa0 = vmfault(pagetable, va0, 0)) == 0) {
+      if((pa0 = vmfault(pagetable, va0, 13)) < 0) {
         return -1;
       }
+      pa0 = walkaddr(pagetable, va0);
+      if(pa0 == 0)
+        return -1;
     }
     n = PGSIZE - (srcva - va0);
     if(n > len)
@@ -466,6 +479,9 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 // Returns 0 on success, -1 on failure.
 // In kernel/vm.c
 
+// In kernel/vm.c
+// In kernel/vm.c -> Replace your vmfault function with this version
+
 uint64
 vmfault(pagetable_t pagetable, uint64 va, uint scause)
 {
@@ -473,85 +489,86 @@ vmfault(pagetable_t pagetable, uint64 va, uint scause)
   pte_t *pte;
   uint64 mem;
 
-  // Determine access type from scause
   char *access_type;
   if (scause == 12) access_type = "exec";
   else if (scause == 13) access_type = "read";
-  else if (scause == 15) access_type = "write";
+  else if (scause == 15 || scause == 7) access_type = "write";
   else access_type = "unknown";
 
-  // Check for invalid access first.
   if (va >= p->sz || va >= MAXVA) {
-    printf("[pid %d] KILL invalid-access va=0x%lx access=%s\n", p->pid, va, access_type);
-    return -1;
+    goto kill;
   }
 
   uint64 pa_va = PGROUNDDOWN(va);
   pte = walk(pagetable, pa_va, 0);
 
-  pte_t pte_val = (pte == 0) ? 0 : *pte;
-  printf("[pid %d] vmfault_debug: va=0x%lx, found pte_val=0x%lx\n", p->pid, va, pte_val);
-  
-  // Case 1: Page is on-demand from the executable.
-  if (pte != 0 && (*pte & PTE_V) == 0 && (*pte & PTE_ONDEMAND)) {
-    printf("[pid %d] PAGEFAULT va=0x%lx access=%s cause=exec\n", p->pid, va, access_type);
-    
-    mem = (uint64)kalloc();
-    if (mem == 0) return -1;
-    memset((void*)mem, 0, PGSIZE);
+  if(pte == 0 || (*pte & PTE_V) == 0) {
+    // --- NEW LOGIC FOR TESTING ---
+    // Before we allocate a new page, check if our tracking array is full.
+    // If it is, we will artificially trigger page replacement to make space.
+    if (p->num_resident >= MAX_RESIDENT_PAGES) {
+      if(fifo_victim_selection() < 0) {
+        // We failed to evict a page even though the set was full.
+        goto kill;
+      }
+    }
+    // --- END NEW LOGIC ---
 
-    // Find the correct program segment header to load data from the file
+    int is_exec_page = 0;
+    // ... (The rest of the logic is the same as the last version) ...
     struct elfhdr elf;
     struct proghdr ph;
     readi(p->executable, 0, (uint64)&elf, 0, sizeof(elf));
     for (int i = 0, off = elf.phoff; i < elf.phnum; i++, off += sizeof(ph)) {
       readi(p->executable, 0, (uint64)&ph, off, sizeof(ph));
       if (ph.vaddr <= pa_va && pa_va < ph.vaddr + ph.memsz) {
-        uint64 file_offset = ph.off + (pa_va - ph.vaddr);
-        // How much to read from the file? It might be less than a full page.
-        uint read_sz = (ph.filesz > (pa_va - ph.vaddr)) ? (ph.filesz - (pa_va - ph.vaddr)) : 0;
-        if(read_sz > PGSIZE) read_sz = PGSIZE;
-
-        if (read_sz > 0 && readi(p->executable, 0, mem, file_offset, read_sz) != read_sz) {
-          kfree((void*)mem);
-          return -1;
-        }
+        is_exec_page = 1;
         break;
       }
     }
-    
-    printf("[pid %d] LOADEXEC va=0x%lx\n", p->pid, pa_va);
-    uint flags = PTE_FLAGS(*pte) | PTE_V;
-    flags &= ~PTE_ONDEMAND; // Turn off the on-demand flag
-    if (mappages(pagetable, pa_va, PGSIZE, mem, flags) != 0) {
-      kfree((void*)mem);
-      return -1;
+
+    if (is_exec_page) {
+      printf("[pid %d] PAGEFAULT va=0x%lx access=%s cause=exec\n", p->pid, va, access_type);
+      if((mem = (uint64)kalloc()) == 0) panic("kalloc failed"); // Should not happen in high-mem test
+      memset((void*)mem, 0, PGSIZE);
+
+      for (int i = 0, off = elf.phoff; i < elf.phnum; i++, off += sizeof(ph)) {
+        readi(p->executable, 0, (uint64)&ph, off, sizeof(ph));
+        if (ph.vaddr <= pa_va && pa_va < ph.vaddr + ph.memsz) {
+          uint flags = PTE_U | PTE_V;
+          if(ph.flags & ELF_PROG_FLAG_READ) flags |= PTE_R;
+          if(ph.flags & ELF_PROG_FLAG_WRITE) flags |= PTE_W;
+          if(ph.flags & ELF_PROG_FLAG_EXEC) flags |= PTE_X;
+          if(mappages(pagetable, pa_va, PGSIZE, mem, flags) != 0) { kfree((void*)mem); goto kill; }
+          uint64 file_offset = ph.off + (pa_va - ph.vaddr);
+          uint read_sz = (ph.filesz > (pa_va - ph.vaddr)) ? (ph.filesz - (pa_va - ph.vaddr)) : 0;
+          if(read_sz > PGSIZE) read_sz = PGSIZE;
+          if (read_sz > 0 && readi(p->executable, 0, mem, file_offset, read_sz) != read_sz) { kfree((void*)mem); goto kill; }
+          break;
+        }
+      }
+      printf("[pid %d] LOADEXEC va=0x%lx\n", p->pid, pa_va);
+    } else {
+      printf("[pid %d] PAGEFAULT va=0x%lx access=%s cause=heap\n", p->pid, va, access_type);
+      if((mem = (uint64)kalloc()) == 0) panic("kalloc failed"); // Should not happen in high-mem test
+      memset((void*)mem, 0, PGSIZE);
+      printf("[pid %d] ALLOC va=0x%lx\n", p->pid, pa_va);
+      if(mappages(pagetable, pa_va, PGSIZE, mem, PTE_R | PTE_W | PTE_U | PTE_V) != 0) { kfree((void*)mem); goto kill; }
     }
-  }
-  // Case 2: Page is for heap/stack and has never been mapped.
-  else if (pte == 0) {
-    printf("[pid %d] PAGEFAULT va=0x%lx access=%s cause=heap\n", p->pid, va, access_type);
     
-    mem = (uint64)kalloc();
-    if (mem == 0) return -1;
-    memset((void*)mem, 0, PGSIZE); // Zero-fill the page
-    
-    printf("[pid %d] ALLOC va=0x%lx\n", p->pid, pa_va);
-    if (mappages(pagetable, pa_va, PGSIZE, mem, PTE_R | PTE_W | PTE_U | PTE_V) != 0) {
-      kfree((void*)mem);
-      return -1;
-    }
-  } else {
-    // Any other case is an invalid access that should not happen
-    printf("[pid %d] KILL invalid-access va=0x%lx access=%s\n", p->pid, va, access_type);
-    return -1;
+    // This part is now safe because we made space if the array was full.
+    p->resident_set[p->num_resident].va = pa_va;
+    p->resident_set[p->num_resident].seq = p->next_fifo_seq;
+    p->num_resident++;
+    printf("[pid %d] RESIDENT va=0x%lx seq=%d\n", p->pid, pa_va, p->next_fifo_seq);
+    p->next_fifo_seq++;
+    return 0;
   }
   
-  // If we successfully handled the fault, log the RESIDENT event.
-  printf("[pid %d] RESIDENT va=0x%lx seq=%d\n", p->pid, pa_va, p->next_fifo_seq);
-  p->next_fifo_seq++;
-
-  return 0;
+kill:
+  printf("[pid %d] KILL invalid-access va=0x%lx access=%s\n", p->pid, va, access_type);
+  setkilled(p);
+  return -1;
 }
 int
 ismapped(pagetable_t pagetable, uint64 va)
@@ -563,5 +580,49 @@ ismapped(pagetable_t pagetable, uint64 va)
   if (*pte & PTE_V){
     return 1;
   }
+  return 0;
+}
+
+// In kernel/vm.c
+
+int
+fifo_victim_selection()
+{
+  struct proc *p = myproc();
+  int victim_idx = -1;
+  int min_seq = -1;
+
+  printf("[pid %d] MEMFULL\n", p->pid);
+
+  if(p->num_resident == 0) {
+    return -1;
+  }
+  
+  for (int i = 0; i < p->num_resident; i++) {
+    if (min_seq == -1 || p->resident_set[i].seq < min_seq) {
+      min_seq = p->resident_set[i].seq;
+      victim_idx = i;
+    }
+  }
+
+  if (victim_idx == -1) {
+    return -1;
+  }
+
+  uint64 victim_va = p->resident_set[victim_idx].va;
+  printf("[pid %d] VICTIM va=0x%lx seq=%d algo=FIFO\n", p->pid, victim_va, min_seq);
+
+  pte_t *pte = walk(p->pagetable, victim_va, 0);
+  char *state = (*pte & PTE_W) ? "dirty" : "clean";
+  printf("[pid %d] EVICT va=0x%lx state=%s\n", p->pid, victim_va, state);
+  
+  uvmunmap(p->pagetable, victim_va, 1, 1);
+
+  // Safely remove the victim from the resident set by shifting elements.
+  for (int i = victim_idx; i < p->num_resident - 1; i++) {
+    p->resident_set[i] = p->resident_set[i+1];
+  }
+  p->num_resident--;
+
   return 0;
 }

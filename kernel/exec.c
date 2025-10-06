@@ -30,7 +30,6 @@ int flags2perm(int flags)
 int
 kexec(char *path, char **argv)
 {
-  printf("hi\n");
   char *s, *last;
   int i, off;
   uint64 argc, sz = 0, sp, ustack[MAXARG], stackbase;
@@ -132,6 +131,8 @@ kexec(char *path, char **argv)
   // Commit to the new user image.
   p->pagetable = pagetable;
   p->sz = sz;
+
+  printf("[pid %d] kexec_debug: SETTING p->sz to 0x%lx\n", p->pid, p->sz);
   p->trapframe->epc = elf.entry;
   p->trapframe->sp = sp;
   p->trapframe->a1 = sp;
