@@ -482,6 +482,8 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 // In kernel/vm.c
 // In kernel/vm.c -> Replace your vmfault function with this version
 
+// In kernel/vm.c -> Final corrected version of vmfault
+
 uint64
 vmfault(pagetable_t pagetable, uint64 va, uint scause)
 {
@@ -502,20 +504,11 @@ vmfault(pagetable_t pagetable, uint64 va, uint scause)
   uint64 pa_va = PGROUNDDOWN(va);
   pte = walk(pagetable, pa_va, 0);
 
+  // If the page is not present (either never mapped, or evicted), handle it.
   if(pte == 0 || (*pte & PTE_V) == 0) {
-    // --- NEW LOGIC FOR TESTING ---
-    // Before we allocate a new page, check if our tracking array is full.
-    // If it is, we will artificially trigger page replacement to make space.
-    if (p->num_resident >= MAX_RESIDENT_PAGES) {
-      if(fifo_victim_selection() < 0) {
-        // We failed to evict a page even though the set was full.
-        goto kill;
-      }
-    }
-    // --- END NEW LOGIC ---
-
+    // Artificial trigger for testing: if our software tracking array is full,
+    // evict a page to make space.    
     int is_exec_page = 0;
-    // ... (The rest of the logic is the same as the last version) ...
     struct elfhdr elf;
     struct proghdr ph;
     readi(p->executable, 0, (uint64)&elf, 0, sizeof(elf));
@@ -527,9 +520,14 @@ vmfault(pagetable_t pagetable, uint64 va, uint scause)
       }
     }
 
-    if (is_exec_page) {
+    if (is_exec_page) { // Handle EXEC page faults.
       printf("[pid %d] PAGEFAULT va=0x%lx access=%s cause=exec\n", p->pid, va, access_type);
-      if((mem = (uint64)kalloc()) == 0) panic("kalloc failed"); // Should not happen in high-mem test
+      if (p->num_resident >= MAX_RESIDENT_PAGES) {
+        if(fifo_victim_selection() < 0) {
+          goto kill;
+        }
+      }
+      if((mem = (uint64)kalloc()) == 0) panic("vmfault: kalloc failed");
       memset((void*)mem, 0, PGSIZE);
 
       for (int i = 0, off = elf.phoff; i < elf.phnum; i++, off += sizeof(ph)) {
@@ -548,15 +546,38 @@ vmfault(pagetable_t pagetable, uint64 va, uint scause)
         }
       }
       printf("[pid %d] LOADEXEC va=0x%lx\n", p->pid, pa_va);
-    } else {
-      printf("[pid %d] PAGEFAULT va=0x%lx access=%s cause=heap\n", p->pid, va, access_type);
-      if((mem = (uint64)kalloc()) == 0) panic("kalloc failed"); // Should not happen in high-mem test
+    } 
+    // --- NEW STACK/HEAP LOGIC ---
+    // The stack lives at the top of the user address space. Let's define
+    // a reasonable boundary for it (e.g., top 100 pages).
+    else if (va >= TRAPFRAME - 100*PGSIZE) { // Is the fault in the stack region?
+      printf("[pid %d] PAGEFAULT va=0x%lx access=%s cause=stack\n", p->pid, va, access_type);
+      if (p->num_resident >= MAX_RESIDENT_PAGES) {
+        if(fifo_victim_selection() < 0) {
+          goto kill;
+        }
+      }
+      if((mem = (uint64)kalloc()) == 0) panic("vmfault: kalloc failed");
       memset((void*)mem, 0, PGSIZE);
       printf("[pid %d] ALLOC va=0x%lx\n", p->pid, pa_va);
       if(mappages(pagetable, pa_va, PGSIZE, mem, PTE_R | PTE_W | PTE_U | PTE_V) != 0) { kfree((void*)mem); goto kill; }
     }
+    // All other faults on non-resident pages must be for the heap.
+    else {
+      printf("[pid %d] PAGEFAULT va=0x%lx access=%s cause=heap\n", p->pid, va, access_type);
+      if (p->num_resident >= MAX_RESIDENT_PAGES) {
+        if(fifo_victim_selection() < 0) {
+          goto kill;
+        }
+      }
+      if((mem = (uint64)kalloc()) == 0) panic("vmfault: kalloc failed");
+      memset((void*)mem, 0, PGSIZE);
+      printf("[pid %d] ALLOC va=0x%lx\n", p->pid, pa_va);
+      if(mappages(pagetable, pa_va, PGSIZE, mem, PTE_R | PTE_W | PTE_U | PTE_V) != 0) { kfree((void*)mem); goto kill; }
+    }
+    // --- END NEW LOGIC ---
     
-    // This part is now safe because we made space if the array was full.
+    if (p->num_resident >= MAX_RESIDENT_PAGES) panic("resident set overflow after replacement");
     p->resident_set[p->num_resident].va = pa_va;
     p->resident_set[p->num_resident].seq = p->next_fifo_seq;
     p->num_resident++;
@@ -566,6 +587,7 @@ vmfault(pagetable_t pagetable, uint64 va, uint scause)
   }
   
 kill:
+  // All other cases (e.g., protection fault on a resident page) are fatal.
   printf("[pid %d] KILL invalid-access va=0x%lx access=%s\n", p->pid, va, access_type);
   setkilled(p);
   return -1;

@@ -101,11 +101,12 @@ kexec(char *path, char **argv)
   sz = PGROUNDUP(sz);
   
   // Allocate the user stack.
-  if((sz = uvmalloc(pagetable, sz, sz + (USERSTACK+1)*PGSIZE, PTE_W)) == 0)
-    goto bad;
-  
-  uvmclear(pagetable, sz-(USERSTACK+1)*PGSIZE);
+  //if((sz = uvmalloc(pagetable, sz, sz + (USERSTACK+1)*PGSIZE, PTE_W)) == 0)
+  //  goto bad;
+  sz=sz+(USERSTACK+1)*PGSIZE;
+  //uvmclear(pagetable, sz-(USERSTACK+1)*PGSIZE);
   sp = sz;
+  p->sz=sz;
   stackbase = sp - USERSTACK*PGSIZE;
 
   // Push arguments to the stack.

@@ -5,7 +5,24 @@
 
 // A large global array to test faulting on the data segment.
 char global_array[8192];
+// Add this helper function to your test file
 
+void print_stack(int n_bytes) {
+  char dummy; // A local variable to get an address on the current stack frame
+  char *sp = &dummy; // Use the address of the local variable as a starting point
+
+  printf("\n--- Printing User Stack (approx. %d bytes) ---\n", n_bytes);
+  for (int i = 0; i < n_bytes; i++) {
+    // Print a new line with the base address every 16 bytes for readability
+    if (i % 16 == 0) {
+      // The stack grows down, so we print from sp up to see older stack frames
+      printf("\n0x%lx: ", (uint64)(sp + i));
+    }
+    // Print each byte as a two-digit hex number
+    printf("%x ", (unsigned char)sp[i]);
+  }
+  printf("\n---------------------------------------------\n\n");
+}
 // A recursive function to test stack growth.
 void stack_test(int n) {
   char local_buf[100];
@@ -28,7 +45,9 @@ int main(int argc, char *argv[]) {
   global_array[0] = 'a';
   global_array[sizeof(global_array) - 1] = 'z';
   printf("Data segment test OK.\n");
-
+  printf("\n--- Testing Stack Growth ---\n");
+  stack_test(300);
+  printf("Stack test OK.\n");
   // 2. Test Heap Growth (sbrk) & Page Replacement
   printf("\n--- Testing Heap (sbrk) & Page Replacement ---\n");
   
@@ -76,9 +95,8 @@ int main(int argc, char *argv[]) {
   }
 
   // 3. Test Stack Growth Faults
-  printf("\n--- Testing Stack Growth ---\n");
-  stack_test(30);
-  printf("Stack test OK.\n");
+  printf("-------------reading stack--------------\n");
+  print_stack(250);
 
   // 4. Test Invalid Access
   printf("\n--- Testing Invalid Access ---\n");
@@ -87,6 +105,5 @@ int main(int argc, char *argv[]) {
   *(char*)0 = 'a';
 
   printf("!!! TEST FAILED: Invalid access did not terminate the process.\n");
-
   exit(0);
 }
