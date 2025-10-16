@@ -242,7 +242,74 @@ bad:
   return -1;
 }
 
-static struct inode*
+// Make a kernel-callable unlink(path) helper so other kernel files
+// (proc.c, vm.c) can remove files directly.
+int
+unlink(char *path)
+{
+  struct inode *ip, *dp;
+  struct dirent de;
+  char name[DIRSIZ], pathbuf[MAXPATH];
+  uint off;
+
+  if (!path)
+    return -1;
+
+  // copy path into local buffer
+  int len = strlen(path);
+  if (len >= MAXPATH)
+    return -1;
+  memmove(pathbuf, path, len+1);
+
+  begin_op();
+  if((dp = nameiparent(pathbuf, name)) == 0){
+    end_op();
+    return -1;
+  }
+
+  ilock(dp);
+
+  // Cannot unlink "." or "..".
+  if(namecmp(name, ".") == 0 || namecmp(name, "..") == 0){
+    iunlockput(dp);
+    end_op();
+    return -1;
+  }
+
+  if((ip = dirlookup(dp, name, &off)) == 0){
+    iunlockput(dp);
+    end_op();
+    return -1;
+  }
+  ilock(ip);
+
+  if(ip->nlink < 1)
+    panic("unlink: nlink < 1");
+  if(ip->type == T_DIR && !isdirempty(ip)){
+    iunlockput(ip);
+    iunlockput(dp);
+    end_op();
+    return -1;
+  }
+
+  memset(&de, 0, sizeof(de));
+  if(writei(dp, 0, (uint64)&de, off, sizeof(de)) != sizeof(de))
+    panic("unlink: writei");
+  if(ip->type == T_DIR){
+    dp->nlink--;
+    iupdate(dp);
+  }
+  iunlockput(dp);
+
+  ip->nlink--;
+  iupdate(ip);
+  iunlockput(ip);
+
+  end_op();
+  return 0;
+}
+
+struct inode*
 create(char *path, short type, short major, short minor)
 {
   struct inode *ip, *dp;

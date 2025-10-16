@@ -5,6 +5,11 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "fs.h"
+#include "syscall.h"
+#include "stat.h"
+#include "fcntl.h"
+#include "defs.h"
 
 struct cpu cpus[NCPU];
 
@@ -126,6 +131,14 @@ found:
   p->state = USED;
   p->next_fifo_seq = 0; 
   p->num_resident = 0;
+
+  // initialize swap metadata
+  p->swapfile = 0;
+  p->num_swap_used = 0;
+  for (int si = 0; si < SWAP_MAX_PAGES; si++) {
+    p->swap_slots[si].used = 0;
+    p->swap_slots[si].va = 0;
+  }
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -350,9 +363,33 @@ kexit(int status)
     iput(p->executable);
     p->executable = 0;
   }
-  if (p->executable) {
-    iput(p->executable);
-    p->executable = 0;
+
+  // cleanup swapfile if present
+  if (p->swapfile) {
+    int freed = p->num_swap_used;
+
+    // close file
+    fileclose(p->swapfile);
+    p->swapfile = 0;
+
+    // unlink the swap filename "/pgswp<pid>"
+    char name[32];
+    // build name "/pgswp<digits>"
+    build_swapname_helper(p, name);
+
+    begin_op();
+    unlink(name);
+    end_op();
+
+    // log cleanup
+    printf("[pid %d] SWAPCLEANUP freed_slots=%d\n", p->pid, freed);
+
+    // clear slot bookkeeping
+    p->num_swap_used = 0;
+    for (int si = 0; si < SWAP_MAX_PAGES; si++) {
+      p->swap_slots[si].used = 0;
+      p->swap_slots[si].va = 0;
+    }
   }
 
   acquire(&wait_lock);

@@ -85,6 +85,17 @@ struct resident_page {
   uint64 va;  // The virtual address of the page
   int seq;    // The FIFO sequence number when it was brought in
 };
+
+// Bookkeeping for a page stored on swap (distinct from resident pages).
+#ifndef SWAP_MAX_PAGES
+#define SWAP_MAX_PAGES 1024   // 4 MB (1024 * 4096)
+#endif
+
+struct swap_slot {
+  uint64 va;   // virtual address stored in this slot (page-aligned)
+  int used;    // 0 = free, 1 = occupied
+};
+
 // Per-process state
 struct proc {
   struct spinlock lock;
@@ -112,4 +123,9 @@ struct proc {
   int next_fifo_seq;
   struct resident_page resident_set[MAX_RESIDENT_PAGES];
   int num_resident; // Number of pages currently in the resident set
+
+  // Per-process swap bookkeeping (distinct from resident set)
+  struct file *swapfile;                 // per-process swap file (kernel file*)
+  struct swap_slot swap_slots[SWAP_MAX_PAGES]; // on-disk slots
+  int num_swap_used;                     // number of occupied swap slots
 };

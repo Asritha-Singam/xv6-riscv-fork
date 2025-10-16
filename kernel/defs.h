@@ -55,6 +55,12 @@ int             writei(struct inode*, int, uint64, uint, uint);
 void            itrunc(struct inode*);
 void            ireclaim(int);
 
+// make create() available to other kernel files (used by vm.c to create swap files)
+struct inode*   create(char *path, short type, short major, short minor);
+
+// Export kernel unlink so other kernel code can remove files.
+int             unlink(char *path);
+
 // kalloc.c
 void*           kalloc(void);
 void            kfree(void *);
@@ -171,7 +177,7 @@ int             ismapped(pagetable_t, uint64);
 uint64          vmfault(pagetable_t, uint64, uint);
 
 int             fifo_victim_selection(void); 
-
+void build_swapname_helper(struct proc *, char *);
 
 // plic.c
 void            plicinit(void);

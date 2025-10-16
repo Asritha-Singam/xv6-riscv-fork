@@ -7,53 +7,32 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "fs.h"
+#include "sleeplock.h"
+#include "file.h"
+#include "stat.h"
 
-/*
- * the kernel's page table.
- */
+extern struct inode* create(char *path, short type, short major, short minor);
+
 pagetable_t kernel_pagetable;
+extern char etext[];
+extern char trampoline[];
 
-extern char etext[];  // kernel.ld sets this to end of kernel code.
-
-extern char trampoline[]; // trampoline.S
-
-// Make a direct-map page table for the kernel.
 pagetable_t
 kvmmake(void)
 {
   pagetable_t kpgtbl;
-
   kpgtbl = (pagetable_t) kalloc();
   memset(kpgtbl, 0, PGSIZE);
-
-  // uart registers
   kvmmap(kpgtbl, UART0, UART0, PGSIZE, PTE_R | PTE_W);
-
-  // virtio mmio disk interface
   kvmmap(kpgtbl, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
-
-  // PLIC
   kvmmap(kpgtbl, PLIC, PLIC, 0x4000000, PTE_R | PTE_W);
-
-  // map kernel text executable and read-only.
   kvmmap(kpgtbl, KERNBASE, KERNBASE, (uint64)etext-KERNBASE, PTE_R | PTE_X);
-
-  // map kernel data and the physical RAM we'll make use of.
   kvmmap(kpgtbl, (uint64)etext, (uint64)etext, PHYSTOP-(uint64)etext, PTE_R | PTE_W);
-
-  // map the trampoline for trap entry/exit to
-  // the highest virtual address in the kernel.
   kvmmap(kpgtbl, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
-
-  // allocate and map a kernel stack for each process.
   proc_mapstacks(kpgtbl);
-  
   return kpgtbl;
 }
 
-// add a mapping to the kernel page table.
-// only used when booting.
-// does not flush TLB or enable paging.
 void
 kvmmap(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 sz, int perm)
 {
@@ -61,39 +40,20 @@ kvmmap(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 sz, int perm)
     panic("kvmmap");
 }
 
-// Initialize the kernel_pagetable, shared by all CPUs.
 void
 kvminit(void)
 {
   kernel_pagetable = kvmmake();
 }
 
-// Switch the current CPU's h/w page table register to
-// the kernel's page table, and enable paging.
 void
 kvminithart()
 {
-  // wait for any previous writes to the page table memory to finish.
   sfence_vma();
-
   w_satp(MAKE_SATP(kernel_pagetable));
-
-  // flush stale entries from the TLB.
   sfence_vma();
 }
 
-// Return the address of the PTE in page table pagetable
-// that corresponds to virtual address va.  If alloc!=0,
-// create any required page-table pages.
-//
-// The risc-v Sv39 scheme has three levels of page-table
-// pages. A page-table page contains 512 64-bit PTEs.
-// A 64-bit virtual address is split into five fields:
-//   39..63 -- must be zero.
-//   30..38 -- 9 bits of level-2 index.
-//   21..29 -- 9 bits of level-1 index.
-//   12..20 -- 9 bits of level-0 index.
-//    0..11 -- 12 bits of byte offset within the page.
 pte_t *
 walk(pagetable_t pagetable, uint64 va, int alloc)
 {
@@ -114,9 +74,6 @@ walk(pagetable_t pagetable, uint64 va, int alloc)
   return &pagetable[PX(0, va)];
 }
 
-// Look up a virtual address, return the physical address,
-// or 0 if not mapped.
-// Can only be used to look up user pages.
 uint64
 walkaddr(pagetable_t pagetable, uint64 va)
 {
@@ -137,11 +94,6 @@ walkaddr(pagetable_t pagetable, uint64 va)
   return pa;
 }
 
-// Create PTEs for virtual addresses starting at va that refer to
-// physical addresses starting at pa.
-// va and size MUST be page-aligned.
-// Returns 0 on success, -1 if walk() couldn't
-// allocate a needed page-table page.
 int
 mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
 {
@@ -150,10 +102,8 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
 
   if((va % PGSIZE) != 0)
     panic("mappages: va not aligned");
-
   if((size % PGSIZE) != 0)
     panic("mappages: size not aligned");
-
   if(size == 0)
     panic("mappages: size");
   
@@ -173,8 +123,6 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
   return 0;
 }
 
-// create an empty user page table.
-// returns 0 if out of memory.
 pagetable_t
 uvmcreate()
 {
@@ -186,9 +134,6 @@ uvmcreate()
   return pagetable;
 }
 
-// Remove npages of mappings starting from va. va must be
-// page-aligned. It's OK if the mappings don't exist.
-// Optionally free the physical memory.
 void
 uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 {
@@ -199,9 +144,9 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
     panic("uvmunmap: not aligned");
 
   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
-    if((pte = walk(pagetable, a, 0)) == 0) // leaf page table entry allocated?
+    if((pte = walk(pagetable, a, 0)) == 0)
       continue;   
-    if((*pte & PTE_V) == 0)  // has physical page been allocated?
+    if((*pte & PTE_V) == 0)
       continue;
     if(do_free){
       uint64 pa = PTE2PA(*pte);
@@ -211,8 +156,6 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
   }
 }
 
-// Allocate PTEs and physical memory to grow a process from oldsz to
-// newsz, which need not be page aligned.  Returns new size or 0 on error.
 uint64
 uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
 {
@@ -232,7 +175,6 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
       }
       mem = kalloc();
       if (mem == 0) {
-        // Still failed after replacement, this is a fatal error.
         panic("uvmalloc: kalloc failed after replacement");
       }
     }
@@ -246,10 +188,6 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
   return newsz;
 }
 
-// Deallocate user pages to bring the process size from oldsz to
-// newsz.  oldsz and newsz need not be page-aligned, nor does newsz
-// need to be less than oldsz.  oldsz can be larger than the actual
-// process size.  Returns the new process size.
 uint64
 uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
 {
@@ -264,16 +202,12 @@ uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
   return newsz;
 }
 
-// Recursively free page-table pages.
-// All leaf mappings must already have been removed.
 void
 freewalk(pagetable_t pagetable)
 {
-  // there are 2^9 = 512 PTEs in a page table.
   for(int i = 0; i < 512; i++){
     pte_t pte = pagetable[i];
     if((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) == 0){
-      // this PTE points to a lower-level page table.
       uint64 child = PTE2PA(pte);
       freewalk((pagetable_t)child);
       pagetable[i] = 0;
@@ -284,8 +218,6 @@ freewalk(pagetable_t pagetable)
   kfree((void*)pagetable);
 }
 
-// Free user memory pages,
-// then free page-table pages.
 void
 uvmfree(pagetable_t pagetable, uint64 sz)
 {
@@ -293,14 +225,6 @@ uvmfree(pagetable_t pagetable, uint64 sz)
     uvmunmap(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 1);
   freewalk(pagetable);
 }
-
-// Given a parent process's page table, copy
-// its memory into a child's page table.
-// Copies both the page table and the
-// physical memory.
-// returns 0 on success, -1 on failure.
-// frees any allocated pages on failure.
-// In vm.c -> This is the correct uvmcopy function
 
 int
 uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
@@ -314,7 +238,6 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     if((pte = walk(old, i, 0)) == 0)
       continue;
 
-    // Case 1: The page is resident (physically in memory).
     if(*pte & PTE_V) {
       pa = PTE2PA(*pte);
       flags = PTE_FLAGS(*pte);
@@ -325,13 +248,6 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
         kfree(mem);
         goto err;
       }
-    } 
-    // Case 2: The page is on-demand (not in memory, but exists on disk).
-    else if (*pte & PTE_ONDEMAND) {
-      pte_t *new_pte = walk(new, i, 1);
-      if (new_pte == 0)
-        goto err;
-      *new_pte = *pte; // Copy the on-demand PTE to the child.
     }
   }
   return 0;
@@ -340,22 +256,17 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   uvmunmap(new, 0, i / PGSIZE, 1);
   return -1;
 }
-// mark a PTE invalid for user access.
-// used by exec for the user stack guard page.
+
 void
 uvmclear(pagetable_t pagetable, uint64 va)
 {
   pte_t *pte;
-  
   pte = walk(pagetable, va, 0);
   if(pte == 0)
     panic("uvmclear");
   *pte &= ~PTE_U;
 }
 
-// Copy from kernel to user.
-// Copy len bytes from src to virtual address dstva in a given page table.
-// Return 0 on success, -1 on error.
 int
 copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
@@ -378,7 +289,6 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     }
 
     pte = walk(pagetable, va0, 0);
-    // forbid copyout over read-only user text pages.
     if((*pte & PTE_W) == 0)
       return -1;
       
@@ -394,9 +304,6 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
   return 0;
 }
 
-// Copy from user to kernel.
-// Copy len bytes to dst from virtual address srcva in a given page table.
-// Return 0 on success, -1 on error.
 int
 copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
@@ -425,10 +332,6 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
   return 0;
 }
 
-// Copy a null-terminated string from user to kernel.
-// Copy bytes to dst from virtual address srcva in a given page table,
-// until a '\0', or max.
-// Return 0 on success, -1 on error.
 int
 copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 {
@@ -468,21 +371,131 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   }
 }
 
-// allocate and map user memory if process is referencing a page
-// that was lazily allocated in sys_sbrk().
-// returns 0 if va is invalid or already mapped, or if
-// out of physical memory, and physical address if successful.
-// In kernel/vm.c (replace the previous version)
+void
+build_swapname_helper(struct proc *p, char *buf)
+{
+  int n = 0;
+  buf[n++] = '/';
+  buf[n++] = 'p'; buf[n++] = 'g'; buf[n++] = 's'; buf[n++] = 'w'; buf[n++] = 'p';
+  int pid = p->pid;
+  char tmp[16];
+  int ti = 0;
+  if (pid == 0) tmp[ti++] = '0';
+  while (pid > 0) { tmp[ti++] = '0' + (pid % 10); pid /= 10; }
+  for (int j = ti-1; j >= 0; j--) buf[n++] = tmp[j];
+  buf[n] = 0;
+}
 
-// Handles a page fault for a given virtual address.
-// The 'is_write' parameter is 1 if the fault was a store, 0 otherwise.
-// Returns 0 on success, -1 on failure.
-// In kernel/vm.c
+static int
+ensure_swapfile(struct proc *p)
+{
+  if (p->swapfile)
+    return 0;
 
-// In kernel/vm.c
-// In kernel/vm.c -> Replace your vmfault function with this version
+  char name[32];
+  build_swapname_helper(p, name);
 
-// In kernel/vm.c -> Final corrected version of vmfault
+  begin_op();
+  struct inode *ip = create(name, T_FILE, 0, 0);
+  if (!ip) {
+    end_op();
+    return -1;
+  }
+  end_op();
+
+  struct file *f = filealloc();
+  if (f == 0) {
+    iput(ip);
+    return -1;
+  }
+  f->type = FD_INODE;
+  f->ip = ip;
+  f->off = 0;
+  f->readable = 1;
+  f->writable = 1;
+
+  p->swapfile = f;
+  p->num_swap_used = 0;
+  for (int i = 0; i < SWAP_MAX_PAGES; i++) {
+    p->swap_slots[i].used = 0;
+    p->swap_slots[i].va = 0;
+  }
+  printf("[pid %d] SWAPFILE created: %s\n", p->pid, name);
+  return 0;
+}
+
+static int
+find_free_swap_slot(struct proc *p)
+{
+  for (int i = 0; i < SWAP_MAX_PAGES; i++) {
+    if (!p->swap_slots[i].used)
+      return i;
+  }
+  return -1;
+}
+
+// Write page at pa to a free swap slot; returns slot index or -1 on error
+static int
+swap_out_page(struct proc *p, uint64 va, uint64 pa)
+{
+  if (ensure_swapfile(p) < 0)
+    return -1;
+
+  int slot = find_free_swap_slot(p);
+  if (slot < 0) {
+    return -1; // swap full
+  }
+
+  uint offset = slot * PGSIZE;
+  begin_op();
+  int written = writei(p->swapfile->ip, 0, pa, offset, PGSIZE);
+  end_op();
+  printf("exited lock");
+  if (written != PGSIZE) {
+    printf("[pid %d] swap_out_page: writei returned %d, expected %d\n", p->pid, written, PGSIZE);
+    return -1;
+  }
+
+  p->swap_slots[slot].used = 1;
+  p->swap_slots[slot].va = va;
+  p->num_swap_used++;
+  printf("[pid %d] SWAPOUT va=0x%lx slot=%d\n", p->pid, va, slot);
+  return slot;
+}
+
+// Read page for va from swap into mem (must be allocated)
+static int
+swap_in_page(struct proc *p, uint64 va, char *mem)
+{
+  if (!p->swapfile)
+    return -1;
+  
+  int slot = -1;
+  for (int i = 0; i < SWAP_MAX_PAGES; i++) {
+    if (p->swap_slots[i].used && p->swap_slots[i].va == va) {
+      slot = i;
+      break;
+    }
+  }
+  if (slot < 0)
+    return -1;
+
+  uint offset = slot * PGSIZE;
+  
+  int n = readi(p->swapfile->ip, 0, (uint64)mem, offset, PGSIZE);
+  
+  
+  if (n != PGSIZE) {
+    printf("[pid %d] swap_in_page: readi returned %d, expected %d\n", p->pid, n, PGSIZE);
+    return -1;
+  }
+
+  p->swap_slots[slot].used = 0;
+  p->swap_slots[slot].va = 0;
+  p->num_swap_used--;
+
+  return slot;
+}
 
 uint64
 vmfault(pagetable_t pagetable, uint64 va, uint scause)
@@ -497,30 +510,66 @@ vmfault(pagetable_t pagetable, uint64 va, uint scause)
   else if (scause == 15 || scause == 7) access_type = "write";
   else access_type = "unknown";
 
-  if (va >= p->sz || va >= MAXVA) {
+  if (va >= MAXVA) {
     goto kill;
   }
 
   uint64 pa_va = PGROUNDDOWN(va);
   pte = walk(pagetable, pa_va, 0);
 
-  // If the page is not present (either never mapped, or evicted), handle it.
   if(pte == 0 || (*pte & PTE_V) == 0) {
-    // Artificial trigger for testing: if our software tracking array is full,
-    // evict a page to make space.    
-    int is_exec_page = 0;
-    struct elfhdr elf;
-    struct proghdr ph;
-    readi(p->executable, 0, (uint64)&elf, 0, sizeof(elf));
-    for (int i = 0, off = elf.phoff; i < elf.phnum; i++, off += sizeof(ph)) {
-      readi(p->executable, 0, (uint64)&ph, off, sizeof(ph));
-      if (ph.vaddr <= pa_va && pa_va < ph.vaddr + ph.memsz) {
-        is_exec_page = 1;
-        break;
+
+    // Check if page is in swap
+    if (p->swapfile) {
+      for (int si = 0; si < SWAP_MAX_PAGES; si++) {
+        if (p->swap_slots[si].used && p->swap_slots[si].va == pa_va) {
+          printf("[pid %d] PAGEFAULT va=0x%lx access=%s cause=swap\n", p->pid, va, access_type);
+          if (p->num_resident >= MAX_RESIDENT_PAGES) {
+            if (fifo_victim_selection() < 0) goto kill;
+          }
+          if ((mem = (uint64)kalloc()) == 0) panic("vmfault: kalloc failed");
+          memset((void*)mem, 0, PGSIZE);
+
+          int slot = swap_in_page(p, pa_va, (char*)mem);
+          if (slot < 0) { kfree((void*)mem); goto kill; }
+
+          if (mappages(pagetable, pa_va, PGSIZE, mem, PTE_R | PTE_W | PTE_U | PTE_V) != 0) { 
+            kfree((void*)mem); 
+            goto kill; 
+          }
+          printf("[pid %d] SWAPIN va=0x%lx slot=%d\n", p->pid, pa_va, slot);
+
+          if (p->num_resident >= MAX_RESIDENT_PAGES) 
+            panic("resident set overflow after replacement");
+          p->resident_set[p->num_resident].va = pa_va;
+          p->resident_set[p->num_resident].seq = p->next_fifo_seq;
+          p->num_resident++;
+          printf("[pid %d] RESIDENT va=0x%lx seq=%d\n", p->pid, pa_va, p->next_fifo_seq);
+          p->next_fifo_seq++;
+          return 0;
+        }
       }
     }
 
-    if (is_exec_page) { // Handle EXEC page faults.
+    // Check if it's an executable page
+    int is_exec_page = 0;
+    struct elfhdr elf;
+    struct proghdr ph;
+
+    if (p->executable) {
+      if (readi(p->executable, 0, (uint64)&elf, 0, sizeof(elf)) == sizeof(elf)) {
+        for (int i = 0, off = elf.phoff; i < elf.phnum; i++, off += sizeof(ph)) {
+          if (readi(p->executable, 0, (uint64)&ph, off, sizeof(ph)) != sizeof(ph))
+            break;
+          if (ph.vaddr <= pa_va && pa_va < ph.vaddr + ph.memsz) {
+            is_exec_page = 1;
+            break;
+          }
+        }
+      }
+    }
+
+    if (is_exec_page) {
       printf("[pid %d] PAGEFAULT va=0x%lx access=%s cause=exec\n", p->pid, va, access_type);
       if (p->num_resident >= MAX_RESIDENT_PAGES) {
         if(fifo_victim_selection() < 0) {
@@ -531,26 +580,30 @@ vmfault(pagetable_t pagetable, uint64 va, uint scause)
       memset((void*)mem, 0, PGSIZE);
 
       for (int i = 0, off = elf.phoff; i < elf.phnum; i++, off += sizeof(ph)) {
-        readi(p->executable, 0, (uint64)&ph, off, sizeof(ph));
+        if (readi(p->executable, 0, (uint64)&ph, off, sizeof(ph)) != sizeof(ph))
+          break;
         if (ph.vaddr <= pa_va && pa_va < ph.vaddr + ph.memsz) {
           uint flags = PTE_U | PTE_V;
           if(ph.flags & ELF_PROG_FLAG_READ) flags |= PTE_R;
           if(ph.flags & ELF_PROG_FLAG_WRITE) flags |= PTE_W;
           if(ph.flags & ELF_PROG_FLAG_EXEC) flags |= PTE_X;
-          if(mappages(pagetable, pa_va, PGSIZE, mem, flags) != 0) { kfree((void*)mem); goto kill; }
+          if(mappages(pagetable, pa_va, PGSIZE, mem, flags) != 0) { 
+            kfree((void*)mem); 
+            goto kill; 
+          }
           uint64 file_offset = ph.off + (pa_va - ph.vaddr);
           uint read_sz = (ph.filesz > (pa_va - ph.vaddr)) ? (ph.filesz - (pa_va - ph.vaddr)) : 0;
           if(read_sz > PGSIZE) read_sz = PGSIZE;
-          if (read_sz > 0 && readi(p->executable, 0, mem, file_offset, read_sz) != read_sz) { kfree((void*)mem); goto kill; }
+          if (read_sz > 0 && readi(p->executable, 0, mem, file_offset, read_sz) != read_sz) { 
+            kfree((void*)mem); 
+            goto kill; 
+          }
           break;
         }
       }
       printf("[pid %d] LOADEXEC va=0x%lx\n", p->pid, pa_va);
     } 
-    // --- NEW STACK/HEAP LOGIC ---
-    // The stack lives at the top of the user address space. Let's define
-    // a reasonable boundary for it (e.g., top 100 pages).
-    else if (va >= TRAPFRAME - 100*PGSIZE) { // Is the fault in the stack region?
+    else if (va >= TRAPFRAME - 100*PGSIZE) {
       printf("[pid %d] PAGEFAULT va=0x%lx access=%s cause=stack\n", p->pid, va, access_type);
       if (p->num_resident >= MAX_RESIDENT_PAGES) {
         if(fifo_victim_selection() < 0) {
@@ -560,10 +613,12 @@ vmfault(pagetable_t pagetable, uint64 va, uint scause)
       if((mem = (uint64)kalloc()) == 0) panic("vmfault: kalloc failed");
       memset((void*)mem, 0, PGSIZE);
       printf("[pid %d] ALLOC va=0x%lx\n", p->pid, pa_va);
-      if(mappages(pagetable, pa_va, PGSIZE, mem, PTE_R | PTE_W | PTE_U | PTE_V) != 0) { kfree((void*)mem); goto kill; }
+      if(mappages(pagetable, pa_va, PGSIZE, mem, PTE_R | PTE_W | PTE_U | PTE_V) != 0) { 
+        kfree((void*)mem); 
+        goto kill; 
+      }
     }
-    // All other faults on non-resident pages must be for the heap.
-    else {
+    else if (va < p->sz) {
       printf("[pid %d] PAGEFAULT va=0x%lx access=%s cause=heap\n", p->pid, va, access_type);
       if (p->num_resident >= MAX_RESIDENT_PAGES) {
         if(fifo_victim_selection() < 0) {
@@ -573,11 +628,17 @@ vmfault(pagetable_t pagetable, uint64 va, uint scause)
       if((mem = (uint64)kalloc()) == 0) panic("vmfault: kalloc failed");
       memset((void*)mem, 0, PGSIZE);
       printf("[pid %d] ALLOC va=0x%lx\n", p->pid, pa_va);
-      if(mappages(pagetable, pa_va, PGSIZE, mem, PTE_R | PTE_W | PTE_U | PTE_V) != 0) { kfree((void*)mem); goto kill; }
+      if(mappages(pagetable, pa_va, PGSIZE, mem, PTE_R | PTE_W | PTE_U | PTE_V) != 0) { 
+        kfree((void*)mem); 
+        goto kill; 
+      }
     }
-    // --- END NEW LOGIC ---
-    
-    if (p->num_resident >= MAX_RESIDENT_PAGES) panic("resident set overflow after replacement");
+    else {
+      goto kill;
+    }
+
+    if (p->num_resident >= MAX_RESIDENT_PAGES) 
+      panic("resident set overflow after replacement");
     p->resident_set[p->num_resident].va = pa_va;
     p->resident_set[p->num_resident].seq = p->next_fifo_seq;
     p->num_resident++;
@@ -587,11 +648,11 @@ vmfault(pagetable_t pagetable, uint64 va, uint scause)
   }
   
 kill:
-  // All other cases (e.g., protection fault on a resident page) are fatal.
   printf("[pid %d] KILL invalid-access va=0x%lx access=%s\n", p->pid, va, access_type);
   setkilled(p);
   return -1;
 }
+
 int
 ismapped(pagetable_t pagetable, uint64 va)
 {
@@ -605,46 +666,71 @@ ismapped(pagetable_t pagetable, uint64 va)
   return 0;
 }
 
-// In kernel/vm.c
-
+// vm.c
 int
-fifo_victim_selection()
+fifo_victim_selection(void)
 {
   struct proc *p = myproc();
-  int victim_idx = -1;
-  int min_seq = -1;
 
   printf("[pid %d] MEMFULL\n", p->pid);
-
-  if(p->num_resident == 0) {
+  if (p->num_resident == 0)
     return -1;
-  }
-  
-  for (int i = 0; i < p->num_resident; i++) {
-    if (min_seq == -1 || p->resident_set[i].seq < min_seq) {
-      min_seq = p->resident_set[i].seq;
-      victim_idx = i;
+
+  for (;;) {
+    // Find the oldest (min seq) among CURRENT entries
+    int victim_idx = -1;
+    int min_seq = -1;
+    for (int i = 0; i < p->num_resident; i++) {
+      if (victim_idx < 0 || p->resident_set[i].seq < min_seq) {
+        min_seq = p->resident_set[i].seq;
+        victim_idx = i;
+      }
     }
+    if (victim_idx < 0)
+      return -1; // nothing left
+
+    uint64 victim_va = p->resident_set[victim_idx].va;
+    printf("[pid %d] VICTIM va=0x%lx seq=%d algo=FIFO\n", p->pid, victim_va, min_seq);
+
+    // Check current residency
+    pte_t *pte = walk(p->pagetable, victim_va, 0);
+    if (pte == 0 || (*pte & PTE_V) == 0) {
+      // STALE entry: drop it from resident_set and retry
+      for (int j = victim_idx; j < p->num_resident - 1; j++)
+        p->resident_set[j] = p->resident_set[j+1];
+      p->num_resident--;
+      continue;
+    }
+
+    uint64 pa = PTE2PA(*pte);
+    int is_writable = (*pte & PTE_W) ? 1 : 0;
+    const char *state = is_writable ? "dirty" : "clean";
+    printf("[pid %d] EVICT va=0x%lx state=%s\n", p->pid, victim_va, state);
+
+    if (!is_writable) {
+      // Clean page: just drop mapping + free frame
+      printf("[pid %d] DISCARD va=0x%lx\n", p->pid, victim_va);
+      if (pa) kfree((void*)pa);
+      uvmunmap(p->pagetable, victim_va, 1, 0);
+    } else {
+      // Dirty page: write to swap, then drop mapping + free frame
+      int slot = swap_out_page(p, victim_va, pa);
+      if (slot < 0) {
+        printf("[pid %d] SWAPFULL\n", p->pid);
+        printf("[pid %d] KILL swap-exhausted\n", p->pid);
+        setkilled(p);
+        return -1;
+      }
+      // swap_out_page() already logs SWAPOUT
+      if (pa) kfree((void*)pa);
+      uvmunmap(p->pagetable, victim_va, 1, 0);
+    }
+
+    // Remove victim from resident_set (it’s no longer resident)
+    for (int j = victim_idx; j < p->num_resident - 1; j++)
+      p->resident_set[j] = p->resident_set[j+1];
+    p->num_resident--;
+
+    return 0;
   }
-
-  if (victim_idx == -1) {
-    return -1;
-  }
-
-  uint64 victim_va = p->resident_set[victim_idx].va;
-  printf("[pid %d] VICTIM va=0x%lx seq=%d algo=FIFO\n", p->pid, victim_va, min_seq);
-
-  pte_t *pte = walk(p->pagetable, victim_va, 0);
-  char *state = (*pte & PTE_W) ? "dirty" : "clean";
-  printf("[pid %d] EVICT va=0x%lx state=%s\n", p->pid, victim_va, state);
-  
-  uvmunmap(p->pagetable, victim_va, 1, 1);
-
-  // Safely remove the victim from the resident set by shifting elements.
-  for (int i = victim_idx; i < p->num_resident - 1; i++) {
-    p->resident_set[i] = p->resident_set[i+1];
-  }
-  p->num_resident--;
-
-  return 0;
 }
