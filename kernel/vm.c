@@ -450,9 +450,8 @@ swap_out_page(struct proc *p, uint64 va, uint64 pa)
   begin_op();
   int written = writei(p->swapfile->ip, 0, pa, offset, PGSIZE);
   end_op();
-  printf("exited lock");
   if (written != PGSIZE) {
-    printf("[pid %d] swap_out_page: writei returned %d, expected %d\n", p->pid, written, PGSIZE);
+    //printf("[pid %d] swap_out_page: writei returned %d, expected %d\n", p->pid, written, PGSIZE);
     return -1;
   }
 
