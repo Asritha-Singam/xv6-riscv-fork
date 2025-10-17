@@ -515,7 +515,6 @@ sys_exec(void)
       goto bad;
     }
     if(fetchaddr(uargv+sizeof(uint64)*i, (uint64*)&uarg) < 0){
-      printf("hello1\n");
       goto bad;
     }
     if(uarg == 0){

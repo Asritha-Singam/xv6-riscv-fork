@@ -276,6 +276,8 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
   pte_t *pte;
 
   while(len > 0){
+    if (dstva >= MAXVA)
+      return -1;
     va0 = PGROUNDDOWN(dstva);
     if(va0 >= MAXVA)
       return -1;
@@ -313,6 +315,8 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
   uint64 n, va0, pa0;
 
   while(len > 0){
+    if (srcva >= MAXVA)
+      return -1;
     va0 = PGROUNDDOWN(srcva);
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0) {
@@ -519,7 +523,6 @@ vmfault(pagetable_t pagetable, uint64 va, uint scause)
   else if (scause == 13) access_type = "read";
   else if (scause == 15 || scause == 7) access_type = "write";
   else access_type = "unknown";
-
   if (va >= MAXVA) {
     goto kill;
   }
@@ -592,7 +595,7 @@ vmfault(pagetable_t pagetable, uint64 va, uint scause)
       }
       if((mem = (uint64)kalloc()) == 0) panic("vmfault: kalloc failed");
       memset((void*)mem, 0, PGSIZE);
-
+      printf("[pid %d] LOADEXEC va=0x%lx\n", p->pid, pa_va);
       for (int i = 0, off = elf.phoff; i < elf.phnum; i++, off += sizeof(ph)) {
         if (readi(p->executable, 0, (uint64)&ph, off, sizeof(ph)) != sizeof(ph))
           break;
@@ -620,7 +623,7 @@ vmfault(pagetable_t pagetable, uint64 va, uint scause)
           break;
         }
       }
-      printf("[pid %d] LOADEXEC va=0x%lx\n", p->pid, pa_va);
+      printf("[pid %d] RESIDENT va=0x%lx seq=%d\n", p->pid, pa_va, p->next_fifo_seq-1);
       return 0;
     } 
     else if (va >= p->trapframe->sp - PGSIZE && va < p->trapframe->sp) {
@@ -681,6 +684,26 @@ vmfault(pagetable_t pagetable, uint64 va, uint scause)
     printf("[pid %d] RESIDENT va=0x%lx seq=%d\n", p->pid, pa_va, p->next_fifo_seq);
     p->next_fifo_seq++;
     return 0;*/
+  }else{
+    uint64 flags = PTE_FLAGS(*pte);
+
+    if (is_write_fault && !(flags & PTE_W)) {
+        printf("[pid %d] KILL write-to-readonly va=0x%lx\n", p->pid, va);
+        goto kill;
+    }
+    if (scause == 12 && !(flags & PTE_X)) {
+        printf("[pid %d] KILL exec-from-nonexec va=0x%lx\n", p->pid, va);
+        goto kill;
+    }
+    if (!(flags & PTE_U)) {
+        printf("[pid %d] KILL user-access-to-kernel va=0x%lx\n", p->pid, va);
+        goto kill;
+    }
+
+    // If we reach here, it’s some unexpected cause:
+    printf("[pid %d] KILL unexpected-valid-fault va=0x%lx flags=0x%lx access=%s\n",
+           p->pid, va, flags, access_type);
+    goto kill;
   }
   
 kill:
