@@ -84,6 +84,7 @@ enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 struct resident_page {
   uint64 va;  // The virtual address of the page
   int seq;    // The FIFO sequence number when it was brought in
+  int is_dirty; // Whether the page has been written to
 };
 
 // Bookkeeping for a page stored on swap (distinct from resident pages).
@@ -127,5 +128,8 @@ struct proc {
   // Per-process swap bookkeeping (distinct from resident set)
   struct file *swapfile;                 // per-process swap file (kernel file*)
   struct swap_slot swap_slots[SWAP_MAX_PAGES]; // on-disk slots
-  int num_swap_used;                     // number of occupied swap slots
+  int num_swap_used;    
+  
+  uint64 heap_start;// start of heap (end of data segment)
+  uint64 stack_top;// top of user stack (highest valid stack address)
 };

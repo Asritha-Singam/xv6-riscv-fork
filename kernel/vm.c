@@ -10,8 +10,10 @@
 #include "sleeplock.h"
 #include "file.h"
 #include "stat.h"
+#include "memstat.h"
 
 extern struct inode* create(char *path, short type, short major, short minor);
+void mark_page_dirty(struct proc *p, uint64 va);
 
 pagetable_t kernel_pagetable;
 extern char etext[];
@@ -291,6 +293,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     pte = walk(pagetable, va0, 0);
     if((*pte & PTE_W) == 0)
       return -1;
+    mark_page_dirty(myproc(), va0);
       
     n = PGSIZE - (dstva - va0);
     if(n > len)
@@ -495,6 +498,14 @@ swap_in_page(struct proc *p, uint64 va, char *mem)
 
   return slot;
 }
+void mark_page_dirty(struct proc *p, uint64 va) {
+  for (int i = 0; i < p->num_resident; i++) {
+    if (p->resident_set[i].va == va) {
+      p->resident_set[i].is_dirty = 1;
+      return;
+    }
+  }
+}
 
 uint64
 vmfault(pagetable_t pagetable, uint64 va, uint scause)
@@ -512,9 +523,12 @@ vmfault(pagetable_t pagetable, uint64 va, uint scause)
   if (va >= MAXVA) {
     goto kill;
   }
-
+  int is_write_fault = (scause == 15 || scause == 7);
   uint64 pa_va = PGROUNDDOWN(va);
   pte = walk(pagetable, pa_va, 0);
+  if (is_write_fault) {
+    mark_page_dirty(p, pa_va);
+  }
 
   if(pte == 0 || (*pte & PTE_V) == 0) {
 
@@ -539,9 +553,10 @@ vmfault(pagetable_t pagetable, uint64 va, uint scause)
           printf("[pid %d] SWAPIN va=0x%lx slot=%d\n", p->pid, pa_va, slot);
 
           if (p->num_resident >= MAX_RESIDENT_PAGES) 
-            panic("resident set overflow after replacement");
+          panic("resident set overflow after replacement");
           p->resident_set[p->num_resident].va = pa_va;
           p->resident_set[p->num_resident].seq = p->next_fifo_seq;
+          p->resident_set[p->num_resident].is_dirty = 0;
           p->num_resident++;
           printf("[pid %d] RESIDENT va=0x%lx seq=%d\n", p->pid, pa_va, p->next_fifo_seq);
           p->next_fifo_seq++;
@@ -590,6 +605,11 @@ vmfault(pagetable_t pagetable, uint64 va, uint scause)
             kfree((void*)mem); 
             goto kill; 
           }
+          p->resident_set[p->num_resident].va  = pa_va;
+          p->resident_set[p->num_resident].seq = p->next_fifo_seq++;
+          p->resident_set[p->num_resident].is_dirty = is_write_fault ? 1 : 0;  // usually 0 for exec/text
+          p->num_resident++;
+
           uint64 file_offset = ph.off + (pa_va - ph.vaddr);
           uint read_sz = (ph.filesz > (pa_va - ph.vaddr)) ? (ph.filesz - (pa_va - ph.vaddr)) : 0;
           if(read_sz > PGSIZE) read_sz = PGSIZE;
@@ -601,8 +621,9 @@ vmfault(pagetable_t pagetable, uint64 va, uint scause)
         }
       }
       printf("[pid %d] LOADEXEC va=0x%lx\n", p->pid, pa_va);
+      return 0;
     } 
-    else if (va >= TRAPFRAME - 100*PGSIZE) {
+    else if (va >= p->trapframe->sp - PGSIZE && va < p->trapframe->sp) {
       printf("[pid %d] PAGEFAULT va=0x%lx access=%s cause=stack\n", p->pid, va, access_type);
       if (p->num_resident >= MAX_RESIDENT_PAGES) {
         if(fifo_victim_selection() < 0) {
@@ -616,6 +637,13 @@ vmfault(pagetable_t pagetable, uint64 va, uint scause)
         kfree((void*)mem); 
         goto kill; 
       }
+      p->resident_set[p->num_resident].va  = pa_va;
+      p->resident_set[p->num_resident].seq = p->next_fifo_seq++;
+      p->resident_set[p->num_resident].is_dirty = is_write_fault ? 1 : 0;  // usually 0 for exec/text
+      p->num_resident++;
+
+      printf("[pid %d] RESIDENT va=0x%lx seq=%d\n", p->pid, pa_va, p->next_fifo_seq-1);
+      return 0;
     }
     else if (va < p->sz) {
       printf("[pid %d] PAGEFAULT va=0x%lx access=%s cause=heap\n", p->pid, va, access_type);
@@ -631,19 +659,28 @@ vmfault(pagetable_t pagetable, uint64 va, uint scause)
         kfree((void*)mem); 
         goto kill; 
       }
+      p->resident_set[p->num_resident].va  = pa_va;
+      p->resident_set[p->num_resident].seq = p->next_fifo_seq++;
+      p->resident_set[p->num_resident].is_dirty = is_write_fault ? 1 : 0;  // usually 0 for exec/text
+      p->num_resident++;
+      printf("[pid %d] RESIDENT va=0x%lx seq=%d\n", p->pid, pa_va, p->next_fifo_seq-1);
+      return 0;
     }
     else {
       goto kill;
     }
 
-    if (p->num_resident >= MAX_RESIDENT_PAGES) 
+    /*if (p->num_resident >= MAX_RESIDENT_PAGES) {
+      int count=p->num_resident;
+      printf("[pid %d] num_resident=%d MAX_RESIDENT_PAGES=%d\n", p->pid, count, MAX_RESIDENT_PAGES);
       panic("resident set overflow after replacement");
+    }
     p->resident_set[p->num_resident].va = pa_va;
     p->resident_set[p->num_resident].seq = p->next_fifo_seq;
     p->num_resident++;
     printf("[pid %d] RESIDENT va=0x%lx seq=%d\n", p->pid, pa_va, p->next_fifo_seq);
     p->next_fifo_seq++;
-    return 0;
+    return 0;*/
   }
   
 kill:
@@ -702,11 +739,16 @@ fifo_victim_selection(void)
     }
 
     uint64 pa = PTE2PA(*pte);
-    int is_writable = (*pte & PTE_W) ? 1 : 0;
-    const char *state = is_writable ? "dirty" : "clean";
-    printf("[pid %d] EVICT va=0x%lx state=%s\n", p->pid, victim_va, state);
+    int is_dirty = 0;
+    for (int k = 0; k < p->num_resident; k++) {
+      if (p->resident_set[k].va == victim_va) {
+        is_dirty = p->resident_set[k].is_dirty;
+        break;
+      }
+    }
+    printf("[pid %d] EVICT va=0x%lx state=%s\n", p->pid, victim_va, is_dirty ? "dirty" : "clean");
 
-    if (!is_writable) {
+    if (!is_dirty) {
       // Clean page: just drop mapping + free frame
       printf("[pid %d] DISCARD va=0x%lx\n", p->pid, victim_va);
       if (pa) kfree((void*)pa);
@@ -731,5 +773,40 @@ fifo_victim_selection(void)
     p->num_resident--;
 
     return 0;
+  }
+}
+void
+fill_memstat(struct proc_mem_stat *info)
+{
+  struct proc *p = myproc();
+  memset(info, 0, sizeof(*info));
+
+  info->pid = p->pid;
+  info->next_fifo_seq = p->next_fifo_seq;
+  info->num_resident_pages = p->num_resident;
+  info->num_swapped_pages = p->num_swap_used;
+
+  // total = resident + swapped + holes up to sz (simplified)
+  info->num_pages_total = PGROUNDUP(p->sz) / PGSIZE;
+
+  int count = 0;
+  for (int i = 0; i < p->num_resident && count < MAX_PAGES_INFO; i++) {
+    info->pages[count].va = p->resident_set[i].va;
+    info->pages[count].state = RESIDENT;
+    info->pages[count].is_dirty = p->resident_set[i].is_dirty;  // if you track dirty, fill here
+    info->pages[count].seq = p->resident_set[i].seq;
+    info->pages[count].swap_slot = -1;
+    count++;
+  }
+
+  for (int i = 0; i < SWAP_MAX_PAGES && count < MAX_PAGES_INFO; i++) {
+    if (p->swap_slots[i].used) {
+      info->pages[count].va = p->swap_slots[i].va;
+      info->pages[count].state = SWAPPED;
+      info->pages[count].is_dirty = 1;
+      info->pages[count].seq = -1; // optional
+      info->pages[count].swap_slot = i;
+      count++;
+    }
   }
 }

@@ -7,6 +7,8 @@
 #include "proc.h"
 #include "vm.h"
 
+#include "memstat.h"
+
 uint64
 sys_exit(void)
 {
@@ -93,4 +95,20 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+uint64
+sys_memstat(void)
+{
+  struct proc *p = myproc();
+  uint64 uaddr; // user address of struct proc_mem_stat
+
+  argaddr(0, &uaddr);
+
+  struct proc_mem_stat kinfo;
+  fill_memstat(&kinfo);
+
+  if (copyout(p->pagetable, uaddr, (char *)&kinfo, sizeof(kinfo)) < 0)
+    return -1;
+
+  return 0;
 }

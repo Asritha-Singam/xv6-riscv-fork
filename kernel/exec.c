@@ -59,7 +59,7 @@ kexec(char *path, char **argv)
   if(p->executable)
     iput(p->executable);
   p->executable = idup(ip);
-
+  
   // Set up lazy-loaded pages for the new executable.
   for(i=0, off=elf.phoff; i<elf.phnum; i++, off+=sizeof(ph)){
     if(readi(ip, 0, (uint64)&ph, off, sizeof(ph)) != sizeof(ph))
@@ -98,6 +98,7 @@ kexec(char *path, char **argv)
 
   oldsz = p->sz;
   oldpagetable = p->pagetable;
+
   sz = PGROUNDUP(sz);
   
   // Allocate the user stack.
@@ -132,8 +133,14 @@ kexec(char *path, char **argv)
   // Commit to the new user image.
   p->pagetable = pagetable;
   p->sz = sz;
+  p->heap_start = PGROUNDUP(sz - (USERSTACK+1)*PGSIZE);
+  p->stack_top = sp;
 
-  printf("[pid %d] kexec_debug: SETTING p->sz to 0x%lx\n", p->pid, p->sz);
+  printf("[pid %d] INIT-LAZYMAP text=[0x%lx,0x%lx) data=[0x%lx,0x%lx) heap_start=0x%lx stack_top=0x%lx\n",
+        p->pid,
+        elf.phoff, elf.phoff + elf.phnum*sizeof(ph),
+        p->heap_start - 2*PGSIZE, p->heap_start, // approximate data region
+        p->heap_start, p->stack_top);
   p->trapframe->epc = elf.entry;
   p->trapframe->sp = sp;
   p->trapframe->a1 = sp;

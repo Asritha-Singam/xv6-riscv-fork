@@ -8,6 +8,7 @@ struct spinlock;
 struct sleeplock;
 struct stat;
 struct superblock;
+struct proc_mem_stat; // For memstat info
 
 // bio.c
 void            binit(void);
@@ -177,7 +178,8 @@ int             ismapped(pagetable_t, uint64);
 uint64          vmfault(pagetable_t, uint64, uint);
 
 int             fifo_victim_selection(void); 
-void build_swapname_helper(struct proc *, char *);
+void            build_swapname_helper(struct proc *, char *);
+void            fill_memstat(struct proc_mem_stat *info);
 
 // plic.c
 void            plicinit(void);
